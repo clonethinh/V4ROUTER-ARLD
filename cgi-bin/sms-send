@@ -1,0 +1,169 @@
+#!/bin/sh
+echo "Content-Type: application/json"
+echo ""
+
+# ==== CẤU HÌNH ====
+SENT_TIME_LOG="/tmp/sms_sent_times"
+ARCHIVE_DIR="/root/sms-archive"
+DELETE_LOG="/tmp/sms_send_delete.log"
+mkdir -p "$ARCHIVE_DIR"
+
+# ==== HÀM LOG ====
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$DELETE_LOG"
+}
+
+# ==== TÌM MODEM TỰ ĐỘNG ====
+MODEM_ID=$(mmcli -L 2>/dev/null | grep -o '/Modem/[0-9]\+' | head -n1 | awk -F/ '{print $NF}')
+
+if [ -z "$MODEM_ID" ]; then
+    echo '{ "status": "error", "message": "Không tìm thấy modem đang hoạt động" }'
+    exit 1
+fi
+
+log_message "Found modem: $MODEM_ID"
+DEVICE="/usr/bin/mmcli"
+
+# ==== GIẢI MÃ URL ====
+urldecode() {
+    echo -e "$(echo "$1" | sed 's/+/ /g; s/%/\\x/g')"
+}
+
+# ==== LẤY THÔNG SỐ ====
+if [ "$REQUEST_METHOD" = "POST" ]; then
+    # Đọc POST data
+    if [ -n "$CONTENT_LENGTH" ] && [ "$CONTENT_LENGTH" -gt 0 ]; then
+        POST_DATA=$(dd bs="$CONTENT_LENGTH" count=1 2>/dev/null)
+    else
+        read -r POST_DATA
+    fi
+    
+    # Parse POST data
+    NUMBER=$(echo "$POST_DATA" | sed -n 's/.*number=\([^&]*\).*/\1/p')
+    TEXT=$(echo "$POST_DATA" | sed -n 's/.*text=\([^&]*\).*/\1/p')
+else
+    # GET request
+    NUMBER=$(echo "$QUERY_STRING" | sed -n 's/.*number=\([^&]*\).*/\1/p')
+    TEXT=$(echo "$QUERY_STRING" | sed -n 's/.*text=\([^&]*\).*/\1/p')
+fi
+
+NUMBER=$(urldecode "$NUMBER")
+TEXT=$(urldecode "$TEXT")
+
+if [ -z "$NUMBER" ] || [ -z "$TEXT" ]; then
+    echo '{ "status": "error", "message": "Thiếu số điện thoại hoặc nội dung" }'
+    exit 1
+fi
+
+log_message "Sending SMS to: $NUMBER, Text: $TEXT"
+
+# ==== GỬI TIN NHẮN ====
+SMS_PATH=$($DEVICE -m "$MODEM_ID" --messaging-create-sms="number='$NUMBER',text='$TEXT'" 2>/dev/null | awk '/\/SMS\// {print $NF}')
+if [ -z "$SMS_PATH" ]; then
+    log_message "Failed to create SMS"
+    echo '{ "status": "error", "message": "Không tạo được SMS" }'
+    exit 1
+fi
+
+# ==== LƯU TIMESTAMP TRƯỚC KHI GỬI ====
+SEND_TIME=$(date "+%Y-%m-%dT%H:%M:%S+07:00")
+SMS_ID=$(echo "$SMS_PATH" | awk -F'/' '{print $NF}')
+
+log_message "Created SMS with ID: $SMS_ID, Path: $SMS_PATH"
+
+SEND_RESULT=$($DEVICE -s "$SMS_PATH" --send 2>&1)
+if echo "$SEND_RESULT" | grep -q "successfully sent"; then
+    log_message "SMS $SMS_ID sent successfully"
+    
+    # ==== LƯU TIMESTAMP VÀO LOG FILE ====
+    echo "${SMS_ID}:${SEND_TIME}" >> "$SENT_TIME_LOG"
+    
+    # ==== DỌN DẸP LOG FILE (GIỮ 100 DÒNG CUỐI) ====
+    if [ -f "$SENT_TIME_LOG" ]; then
+        tail -100 "$SENT_TIME_LOG" > "${SENT_TIME_LOG}.tmp" && mv "${SENT_TIME_LOG}.tmp" "$SENT_TIME_LOG"
+    fi
+    
+    # ==== LƯU FILE JSON SMS ĐÃ GỬI VÀO ARCHIVE ====
+    ARCHIVE_PATH="$ARCHIVE_DIR/${SMS_ID}.json"
+    
+    # Escape JSON strings
+    esc() { echo "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+    NUMBER_ESC=$(esc "$NUMBER")
+    TEXT_ESC=$(esc "$TEXT")
+    
+    ARCHIVE_JSON=$(cat <<EOF
+{
+  "id": $SMS_ID,
+  "number": "$NUMBER_ESC",
+  "text": "$TEXT_ESC",
+  "date": "$SEND_TIME",
+  "type": "submit",
+  "state": "sent",
+  "storage": "router",
+  "read_status": 1
+}
+EOF
+)
+
+    # Lưu vào file archive
+    echo "$ARCHIVE_JSON" > "$ARCHIVE_PATH"
+    
+    # ==== KIỂM TRA FILE ĐÃ LƯU THÀNH CÔNG CHƯA ====
+    if [ -s "$ARCHIVE_PATH" ]; then
+        log_message "SMS $SMS_ID archived successfully to: $ARCHIVE_PATH"
+        
+        # ==== XÓA SMS KHỎI SIM ====
+        log_message "Attempting to delete SMS $SMS_ID from SIM..."
+        
+        # Thử nhiều phương pháp xóa
+        DELETE_SUCCESS=0
+        
+        # Phương pháp 1: Xóa bằng SMS path
+        if [ $DELETE_SUCCESS -eq 0 ]; then
+            DELETE_RESULT=$($DEVICE -s "$SMS_PATH" --delete 2>&1)
+            if echo "$DELETE_RESULT" | grep -q "successfully deleted"; then
+                DELETE_SUCCESS=1
+                log_message "Successfully deleted SMS $SMS_ID using SMS path"
+            else
+                log_message "Failed to delete SMS $SMS_ID using SMS path: $DELETE_RESULT"
+            fi
+        fi
+        
+        # Phương pháp 2: Xóa bằng modem messaging delete
+        if [ $DELETE_SUCCESS -eq 0 ]; then
+            DELETE_RESULT=$($DEVICE -m "$MODEM_ID" --messaging-delete-sms="$SMS_ID" 2>&1)
+            if echo "$DELETE_RESULT" | grep -q "successfully deleted"; then
+                DELETE_SUCCESS=1
+                log_message "Successfully deleted SMS $SMS_ID using modem messaging delete"
+            else
+                log_message "Failed to delete SMS $SMS_ID using modem messaging delete: $DELETE_RESULT"
+            fi
+        fi
+        
+        # Phương pháp 3: Xóa bằng full path
+        if [ $DELETE_SUCCESS -eq 0 ]; then
+            DELETE_RESULT=$($DEVICE -m "$MODEM_ID" --messaging-delete-sms="$SMS_PATH" 2>&1)
+            if echo "$DELETE_RESULT" | grep -q "successfully deleted"; then
+                DELETE_SUCCESS=1
+                log_message "Successfully deleted SMS $SMS_ID using full path"
+            else
+                log_message "Failed to delete SMS $SMS_ID using full path: $DELETE_RESULT"
+            fi
+        fi
+        
+        # ==== TRẢ VỀ RESPONSE JSON ====
+        if [ $DELETE_SUCCESS -eq 1 ]; then
+            echo "{ \"status\": \"success\", \"message\": \"Đã gửi SMS và lưu vào archive\", \"number\": \"$NUMBER\", \"text\": \"$TEXT\", \"date\": \"$SEND_TIME\", \"type\": \"submit\", \"state\": \"sent\", \"sms_id\": $SMS_ID, \"archived\": true, \"deleted_from_sim\": true }"
+        else
+            log_message "WARNING: SMS $SMS_ID sent and archived but failed to delete from SIM"
+            echo "{ \"status\": \"success\", \"message\": \"Đã gửi SMS và lưu vào archive nhưng không xóa được khỏi SIM\", \"number\": \"$NUMBER\", \"text\": \"$TEXT\", \"date\": \"$SEND_TIME\", \"type\": \"submit\", \"state\": \"sent\", \"sms_id\": $SMS_ID, \"archived\": true, \"deleted_from_sim\": false, \"warning\": \"Không thể xóa tin nhắn khỏi SIM\" }"
+        fi
+    else
+        log_message "ERROR: Failed to archive SMS $SMS_ID"
+        echo "{ \"status\": \"error\", \"message\": \"Gửi thành công nhưng không lưu được vào archive\", \"number\": \"$NUMBER\", \"text\": \"$TEXT\", \"sms_id\": $SMS_ID, \"archived\": false }"
+    fi
+    
+else
+    log_message "Failed to send SMS: $SEND_RESULT"
+    echo "{ \"status\": \"error\", \"message\": \"Gửi thất bại\", \"detail\": \"$SEND_RESULT\" }"
+fi
