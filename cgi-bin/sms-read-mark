@@ -1,0 +1,241 @@
+#!/bin/sh
+echo "Content-Type: application/json; charset=utf-8"
+echo ""
+
+# ===== CẤU HÌNH =====
+ARCHIVE_DIR="/root/sms-archive"
+READ_STATUS_FILE="/tmp/sms_read_status"  # Backup cho legacy
+LOG_FILE="/tmp/sms-mark-read.log"
+DEBUG=1  # 1 = bật debug, 0 = tắt debug
+
+# ===== HÀM LOG DEBUG =====
+log_debug() {
+    if [ "$DEBUG" -eq 1 ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+    fi
+}
+
+# ===== HÀM ESCAPE JSON =====
+escape_json() {
+    echo "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g; s/\r/\\r/g; s/\n/\\n/g'
+}
+
+# ===== HÀM TRẢ VỀ LỖI =====
+return_error() {
+    local error_code="$1"
+    local message="$2"
+    local details="$3"
+    
+    log_debug "ERROR: $error_code - $message - $details"
+    
+    cat << EOF
+{
+    "success": false,
+    "status": "error",
+    "error_code": "$error_code",
+    "message": "$(escape_json "$message")",
+    "details": "$(escape_json "$details")",
+    "timestamp": "$(date '+%Y-%m-%d %H:%M:%S')"
+}
+EOF
+    exit 1
+}
+
+# ===== BẮT ĐẦU XỬ LÝ =====
+log_debug "Starting SMS mark-read process - Method: $REQUEST_METHOD"
+
+# ===== LẤY PARAMETERS =====
+MESSAGE_ID=""
+READ_STATUS=""
+
+if [ "$REQUEST_METHOD" = "POST" ]; then
+    # Đọc POST data
+    if [ -n "$CONTENT_LENGTH" ] && [ "$CONTENT_LENGTH" -gt 0 ]; then
+        POST_DATA=$(dd bs="$CONTENT_LENGTH" count=1 2>/dev/null)
+    else
+        read -r POST_DATA
+    fi
+    
+    log_debug "POST_DATA: $POST_DATA"
+    
+    # Parse Content-Type
+    CONTENT_TYPE=$(echo "$CONTENT_TYPE" | tr '[:upper:]' '[:lower:]')
+    
+    if echo "$CONTENT_TYPE" | grep -q "application/json"; then
+        # Parse JSON: {"message_id": "123", "read_status": 1}
+        MESSAGE_ID=$(echo "$POST_DATA" | sed -n 's/.*"message_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+        if [ -z "$MESSAGE_ID" ]; then
+            MESSAGE_ID=$(echo "$POST_DATA" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+        fi
+        
+        READ_STATUS=$(echo "$POST_DATA" | sed -n 's/.*"read_status"[[:space:]]*:[[:space:]]*\([0-9]\).*/\1/p')
+        if [ -z "$READ_STATUS" ]; then
+            READ_STATUS=$(echo "$POST_DATA" | sed -n 's/.*"read"[[:space:]]*:[[:space:]]*\([0-9]\).*/\1/p')
+        fi
+    else
+        # Parse form data: id=123&read_status=1
+        MESSAGE_ID=$(echo "$POST_DATA" | sed -n 's/.*id=\([^&]*\).*/\1/p')
+        if [ -z "$MESSAGE_ID" ]; then
+            MESSAGE_ID=$(echo "$POST_DATA" | sed -n 's/.*message_id=\([^&]*\).*/\1/p')
+        fi
+        
+        READ_STATUS=$(echo "$POST_DATA" | sed -n 's/.*read_status=\([^&]*\).*/\1/p')
+        if [ -z "$READ_STATUS" ]; then
+            READ_STATUS=$(echo "$POST_DATA" | sed -n 's/.*read=\([^&]*\).*/\1/p')
+        fi
+    fi
+else
+    # GET/DELETE request - parse query string
+    MESSAGE_ID=$(echo "$QUERY_STRING" | sed -n 's/.*id=\([^&]*\).*/\1/p')
+    if [ -z "$MESSAGE_ID" ]; then
+        MESSAGE_ID=$(echo "$QUERY_STRING" | sed -n 's/.*message_id=\([^&]*\).*/\1/p')
+    fi
+    
+    READ_STATUS=$(echo "$QUERY_STRING" | sed -n 's/.*read_status=\([^&]*\).*/\1/p')
+    if [ -z "$READ_STATUS" ]; then
+        READ_STATUS=$(echo "$QUERY_STRING" | sed -n 's/.*read=\([^&]*\).*/\1/p')
+    fi
+    
+    log_debug "QUERY_STRING: $QUERY_STRING"
+fi
+
+log_debug "Parsed MESSAGE_ID: $MESSAGE_ID"
+log_debug "Parsed READ_STATUS: $READ_STATUS"
+
+# ===== VALIDATION INPUT =====
+if [ -z "$MESSAGE_ID" ]; then
+    return_error "missing_message_id" "Thiếu tham số message ID" "Vui lòng cung cấp 'id' hoặc 'message_id'"
+fi
+
+if [ -z "$READ_STATUS" ]; then
+    return_error "missing_read_status" "Thiếu tham số read status" "Vui lòng cung cấp 'read_status' hoặc 'read' (0 hoặc 1)"
+fi
+
+# Làm sạch MESSAGE_ID - chỉ giữ lại số
+CLEAN_ID=$(echo "$MESSAGE_ID" | sed 's/[^0-9]//g')
+if [ -z "$CLEAN_ID" ] || [ "$CLEAN_ID" = "0" ]; then
+    return_error "invalid_message_id" "ID tin nhắn không hợp lệ" "ID phải là số nguyên dương: '$MESSAGE_ID'"
+fi
+
+# Validate READ_STATUS
+if [ "$READ_STATUS" != "0" ] && [ "$READ_STATUS" != "1" ]; then
+    return_error "invalid_read_status" "Trạng thái đọc không hợp lệ" "read_status phải là 0 (chưa đọc) hoặc 1 (đã đọc): '$READ_STATUS'"
+fi
+
+# Kiểm tra thư mục archive
+if [ ! -d "$ARCHIVE_DIR" ]; then
+    return_error "archive_not_found" "Thư mục archive không tồn tại" "Đường dẫn: $ARCHIVE_DIR"
+fi
+
+# ===== KIỂM TRA FILE TIN NHẮN =====
+FILE_PATH="$ARCHIVE_DIR/${CLEAN_ID}.json"
+
+if [ ! -f "$FILE_PATH" ]; then
+    return_error "message_not_found" "Không tìm thấy tin nhắn" "File không tồn tại: $FILE_PATH"
+fi
+
+if [ ! -r "$FILE_PATH" ] || [ ! -w "$FILE_PATH" ]; then
+    return_error "file_permission_error" "Không có quyền truy cập file tin nhắn" "File: $FILE_PATH"
+fi
+
+# ===== ĐỌC NỘI DUNG FILE HIỆN TẠI =====
+CURRENT_CONTENT=$(cat "$FILE_PATH" 2>/dev/null)
+if [ -z "$CURRENT_CONTENT" ]; then
+    return_error "file_read_error" "Không thể đọc nội dung file tin nhắn" "File có thể bị lỗi hoặc rỗng: $FILE_PATH"
+fi
+
+log_debug "Current file content: $CURRENT_CONTENT"
+
+# ===== KIỂM TRA FORMAT JSON =====
+CURRENT_READ_STATUS=$(echo "$CURRENT_CONTENT" | sed -n 's/.*"read_status"[[:space:]]*:[[:space:]]*\([01]\).*/\1/p')
+if [ -z "$CURRENT_READ_STATUS" ]; then
+    return_error "invalid_json_format" "File tin nhắn không có trường read_status hợp lệ" "File: $FILE_PATH"
+fi
+
+log_debug "Current read_status: $CURRENT_READ_STATUS"
+
+# ===== KIỂM TRA CÓ CẦN THAY ĐỔI KHÔNG =====
+if [ "$CURRENT_READ_STATUS" = "$READ_STATUS" ]; then
+    log_debug "Read status already matches requested value"
+    
+    cat << EOF
+{
+    "success": true,
+    "status": "success",
+    "message": "Trạng thái đọc đã đúng như yêu cầu",
+    "message_id": "$CLEAN_ID",
+    "read_status": $READ_STATUS,
+    "previous_status": $CURRENT_READ_STATUS,
+    "changed": false,
+    "file_path": "$FILE_PATH",
+    "timestamp": "$(date '+%Y-%m-%d %H:%M:%S')"
+}
+EOF
+    exit 0
+fi
+
+# ===== TẠO BACKUP FILE =====
+BACKUP_FILE="/tmp/sms_${CLEAN_ID}_backup_$(date +%s).json"
+cp "$FILE_PATH" "$BACKUP_FILE" 2>/dev/null
+log_debug "Created backup: $BACKUP_FILE"
+
+# ===== CẬP NHẬT READ_STATUS =====
+NEW_CONTENT=$(echo "$CURRENT_CONTENT" | sed "s/\"read_status\"[[:space:]]*:[[:space:]]*[01]/\"read_status\": $READ_STATUS/g")
+
+# ===== KIỂM TRA THAY ĐỔI THÀNH CÔNG =====
+if [ "$NEW_CONTENT" = "$CURRENT_CONTENT" ]; then
+    return_error "update_failed" "Không thể cập nhật read_status trong file" "Có thể do format JSON không đúng"
+fi
+
+log_debug "New content: $NEW_CONTENT"
+
+# ===== GHI FILE MỚI =====
+if echo "$NEW_CONTENT" > "$FILE_PATH" 2>/dev/null; then
+    # Verify file đã được ghi thành công
+    VERIFY_CONTENT=$(cat "$FILE_PATH" 2>/dev/null)
+    NEW_READ_STATUS=$(echo "$VERIFY_CONTENT" | sed -n 's/.*"read_status"[[:space:]]*:[[:space:]]*\([01]\).*/\1/p')
+    
+    if [ "$NEW_READ_STATUS" = "$READ_STATUS" ]; then
+        log_debug "Successfully updated read_status from $CURRENT_READ_STATUS to $READ_STATUS"
+        
+        # ===== CẬP NHẬT LEGACY FILE (TÙY CHỌN) =====
+        if [ -f "$READ_STATUS_FILE" ]; then
+            LEGACY_DATA=$(cat "$READ_STATUS_FILE" 2>/dev/null || echo "{}")
+            
+            if [ "$READ_STATUS" = "1" ]; then
+                # Thêm/cập nhật read status = true
+                if echo "$LEGACY_DATA" | grep -q "\"$CLEAN_ID\""; then
+                    echo "$LEGACY_DATA" | sed "s/\"$CLEAN_ID\"[[:space:]]*:[[:space:]]*[^,}]*/\"$CLEAN_ID\": true/g" > "$READ_STATUS_FILE"
+                else
+                    echo "$LEGACY_DATA" | sed "s/}/,\"$CLEAN_ID\": true}/g" | sed 's/{,/{/g' > "$READ_STATUS_FILE"
+                fi
+            else
+                # Xóa hoặc set false
+                echo "$LEGACY_DATA" | sed "s/\"$CLEAN_ID\"[[:space:]]*:[[:space:]]*[^,}]*/\"$CLEAN_ID\": false/g" > "$READ_STATUS_FILE"
+            fi
+        fi
+        
+        # ===== TRẢ VỀ KẾT QUẢ THÀNH CÔNG =====
+        cat << EOF
+{
+    "success": true,
+    "status": "success",
+    "message": "Đã cập nhật trạng thái đọc tin nhắn thành công",
+    "message_id": "$CLEAN_ID",
+    "read_status": $READ_STATUS,
+    "previous_status": $CURRENT_READ_STATUS,
+    "changed": true,
+    "file_path": "$FILE_PATH",
+    "backup_file": "$BACKUP_FILE",
+    "timestamp": "$(date '+%Y-%m-%d %H:%M:%S')"
+}
+EOF
+        exit 0
+    else
+        # Rollback
+        cp "$BACKUP_FILE" "$FILE_PATH" 2>/dev/null
+        return_error "verification_failed" "Không thể xác minh thay đổi, đã rollback" "Expected: $READ_STATUS, Got: $NEW_READ_STATUS"
+    fi
+else
+    return_error "file_write_error" "Không thể ghi file tin nhắn" "Có thể do quyền truy cập hoặc dung lượng đĩa"
+fi
