@@ -1,0 +1,259 @@
+#!/bin/sh
+
+echo "Content-Type: application/json; charset=utf-8"
+echo ""
+
+# ===== CẤU HÌNH =====
+ARCHIVE_DIR="/root/sms-archive"
+LOG_FILE="/tmp/sms-delete.log"
+DEBUG=1  # 1 = bật debug, 0 = tắt debug
+
+# ===== HÀM LOG DEBUG =====
+log_debug() {
+    if [ "$DEBUG" -eq 1 ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+    fi
+}
+
+# ===== HÀM ESCAPE JSON =====
+escape_json() {
+    echo "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g; s/\r/\\r/g; s/\n/\\n/g'
+}
+
+# ===== HÀM TRẢ VỀ LỖI =====
+return_error() {
+    local error_code="$1"
+    local message="$2"
+    local details="$3"
+    
+    log_debug "ERROR: $error_code - $message - $details"
+    
+    cat << EOF
+{
+    "success": false,
+    "error_code": "$error_code",
+    "message": "$(escape_json "$message")",
+    "details": "$(escape_json "$details")",
+    "deleted": [],
+    "failed": [],
+    "total": 0,
+    "deleted_count": 0,
+    "failed_count": 0,
+    "timestamp": "$(date '+%Y-%m-%d %H:%M:%S')"
+}
+EOF
+    exit 1
+}
+
+# ===== BẮT ĐẦU XỬ LÝ =====
+log_debug "Starting SMS delete process - Method: $REQUEST_METHOD"
+
+# ===== LẤY DANH SÁCH ID =====
+IDS=""
+
+if [ "$REQUEST_METHOD" = "POST" ]; then
+    # Đọc POST data
+    if [ -n "$CONTENT_LENGTH" ] && [ "$CONTENT_LENGTH" -gt 0 ]; then
+        POST_DATA=$(dd bs="$CONTENT_LENGTH" count=1 2>/dev/null)
+    else
+        read -r POST_DATA
+    fi
+    
+    log_debug "POST_DATA: $POST_DATA"
+    
+    # Parse Content-Type để xử lý khác nhau
+    CONTENT_TYPE=$(echo "$CONTENT_TYPE" | tr '[:upper:]' '[:lower:]')
+    
+    if echo "$CONTENT_TYPE" | grep -q "application/json"; then
+        # Parse JSON: {"ids": ["123", "124"]} hoặc {"message_ids": ["123"]}
+        IDS=$(echo "$POST_DATA" | sed -n 's/.*"ids"[[:space:]]*:[[:space:]]*\[\([^]]*\)\].*/\1/p' | sed 's/"//g' | sed 's/[[:space:]]*,[[:space:]]*/,/g')
+        
+        if [ -z "$IDS" ]; then
+            IDS=$(echo "$POST_DATA" | sed -n 's/.*"message_ids"[[:space:]]*:[[:space:]]*\[\([^]]*\)\].*/\1/p' | sed 's/"//g' | sed 's/[[:space:]]*,[[:space:]]*/,/g')
+        fi
+        
+        if [ -z "$IDS" ]; then
+            # Parse single ID: {"id": "123"}
+            IDS=$(echo "$POST_DATA" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+        fi
+    else
+        # Parse form data: ids=123,124 hoặc ids[]=123&ids[]=124
+        IDS=$(echo "$POST_DATA" | sed -n 's/^.*ids=\([^&]*\).*$/\1/p' | sed 's/%2C/,/g' | sed 's/%20/ /g')
+        
+        if [ -z "$IDS" ]; then
+            # Parse array format: ids[]=123&ids[]=124
+            IDS=$(echo "$POST_DATA" | grep -o 'ids\[\]=[^&]*' | sed 's/ids\[\]=//' | paste -sd ',' -)
+        fi
+    fi
+    
+elif [ "$REQUEST_METHOD" = "GET" ] || [ "$REQUEST_METHOD" = "DELETE" ]; then
+    # Parse query string: ?ids=123,124
+    IDS=$(echo "$QUERY_STRING" | sed -n 's/^.*ids=\([^&]*\).*$/\1/p' | sed 's/%2C/,/g' | sed 's/%20/ /g')
+    
+    if [ -z "$IDS" ]; then
+        # Parse single id: ?id=123
+        IDS=$(echo "$QUERY_STRING" | sed -n 's/^.*id=\([^&]*\).*$/\1/p')
+    fi
+    
+    log_debug "QUERY_STRING: $QUERY_STRING"
+fi
+
+log_debug "Parsed IDS: $IDS"
+
+# ===== VALIDATION INPUT =====
+if [ -z "$IDS" ]; then
+    return_error "missing_ids" "Không có ID tin nhắn để xóa" "Vui lòng cung cấp danh sách ID qua parameter 'ids' hoặc 'id'"
+fi
+
+# Kiểm tra thư mục archive
+if [ ! -d "$ARCHIVE_DIR" ]; then
+    return_error "archive_not_found" "Thư mục archive không tồn tại" "Đường dẫn: $ARCHIVE_DIR"
+fi
+
+if [ ! -w "$ARCHIVE_DIR" ]; then
+    return_error "archive_no_permission" "Không có quyền ghi vào thư mục archive" "Đường dẫn: $ARCHIVE_DIR"
+fi
+
+# ===== KHỞI TẠO BIẾN ĐẾM =====
+DELETED_COUNT=0
+FAILED_COUNT=0
+TOTAL_COUNT=0
+DELETED_IDS=""
+FAILED_IDS=""
+DELETED_DETAILS=""
+FAILED_DETAILS=""
+
+# ===== XỬ LÝ TỪNG ID =====
+# Chuyển đổi dấu phẩy thành space để duyệt
+IFS=','
+for ID in $IDS; do
+    # Làm sạch ID - chỉ giữ lại số
+    CLEAN_ID=$(echo "$ID" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sed 's/[^0-9]//g')
+    
+    # Bỏ qua ID rỗng hoặc không hợp lệ
+    if [ -z "$CLEAN_ID" ] || [ "$CLEAN_ID" = "0" ]; then
+        log_debug "Skipping invalid ID: '$ID'"
+        continue
+    fi
+    
+    TOTAL_COUNT=$((TOTAL_COUNT + 1))
+    log_debug "Processing ID: $CLEAN_ID"
+    
+    # Đường dẫn file cần xóa
+    FILE_PATH="$ARCHIVE_DIR/${CLEAN_ID}.json"
+    
+    # Kiểm tra file có tồn tại không
+    if [ ! -f "$FILE_PATH" ]; then
+        FAILED_COUNT=$((FAILED_COUNT + 1))
+        
+        if [ -z "$FAILED_IDS" ]; then
+            FAILED_IDS="$CLEAN_ID"
+            FAILED_DETAILS="$CLEAN_ID: file không tồn tại"
+        else
+            FAILED_IDS="$FAILED_IDS,$CLEAN_ID"
+            FAILED_DETAILS="$FAILED_DETAILS; $CLEAN_ID: file không tồn tại"
+        fi
+        
+        log_debug "File not found: $FILE_PATH"
+        continue
+    fi
+    
+    # Kiểm tra quyền xóa file
+    if [ ! -w "$FILE_PATH" ]; then
+        FAILED_COUNT=$((FAILED_COUNT + 1))
+        
+        if [ -z "$FAILED_IDS" ]; then
+            FAILED_IDS="$CLEAN_ID"
+            FAILED_DETAILS="$CLEAN_ID: không có quyền xóa"
+        else
+            FAILED_IDS="$FAILED_IDS,$CLEAN_ID"
+            FAILED_DETAILS="$FAILED_DETAILS; $CLEAN_ID: không có quyền xóa"
+        fi
+        
+        log_debug "No permission to delete: $FILE_PATH"
+        continue
+    fi
+    
+    # Thực hiện xóa file
+    if rm "$FILE_PATH" 2>/dev/null; then
+        DELETED_COUNT=$((DELETED_COUNT + 1))
+        
+        if [ -z "$DELETED_IDS" ]; then
+            DELETED_IDS="$CLEAN_ID"
+            DELETED_DETAILS="$CLEAN_ID: xóa thành công"
+        else
+            DELETED_IDS="$DELETED_IDS,$CLEAN_ID"
+            DELETED_DETAILS="$DELETED_DETAILS; $CLEAN_ID: xóa thành công"
+        fi
+        
+        log_debug "Successfully deleted: $FILE_PATH"
+    else
+        FAILED_COUNT=$((FAILED_COUNT + 1))
+        
+        if [ -z "$FAILED_IDS" ]; then
+            FAILED_IDS="$CLEAN_ID"
+            FAILED_DETAILS="$CLEAN_ID: lỗi xóa file"
+        else
+            FAILED_IDS="$FAILED_IDS,$CLEAN_ID"
+            FAILED_DETAILS="$FAILED_DETAILS; $CLEAN_ID: lỗi xóa file"
+        fi
+        
+        log_debug "Failed to delete: $FILE_PATH"
+    fi
+done
+
+# ===== TẠO JSON ARRAYS =====
+DELETED_ARRAY="[]"
+FAILED_ARRAY="[]"
+
+if [ -n "$DELETED_IDS" ]; then
+    DELETED_ARRAY="[\"$(echo "$DELETED_IDS" | sed 's/,/","/g')\"]"
+fi
+
+if [ -n "$FAILED_IDS" ]; then
+    FAILED_ARRAY="[\"$(echo "$FAILED_IDS" | sed 's/,/","/g')\"]"
+fi
+
+# ===== TẠO RESPONSE MESSAGE =====
+if [ $TOTAL_COUNT -eq 0 ]; then
+    MESSAGE="Không có ID hợp lệ để xử lý"
+    SUCCESS=false
+elif [ $DELETED_COUNT -eq $TOTAL_COUNT ]; then
+    MESSAGE="Đã xóa thành công tất cả $DELETED_COUNT tin nhắn từ archive"
+    SUCCESS=true
+elif [ $DELETED_COUNT -gt 0 ]; then
+    MESSAGE="Đã xóa thành công $DELETED_COUNT/$TOTAL_COUNT tin nhắn từ archive"
+    SUCCESS=true
+else
+    MESSAGE="Không thể xóa tin nhắn nào từ archive (tất cả $FAILED_COUNT tin nhắn đều thất bại)"
+    SUCCESS=false
+fi
+
+log_debug "Final result - Success: $SUCCESS, Deleted: $DELETED_COUNT, Failed: $FAILED_COUNT"
+
+# ===== TRẢ VỀ JSON RESPONSE =====
+cat << EOF
+{
+    "success": $SUCCESS,
+    "message": "$(escape_json "$MESSAGE")",
+    "total": $TOTAL_COUNT,
+    "deleted_count": $DELETED_COUNT,
+    "failed_count": $FAILED_COUNT,
+    "deleted": $DELETED_ARRAY,
+    "failed": $FAILED_ARRAY,
+    "details": {
+        "deleted": "$(escape_json "$DELETED_DETAILS")",
+        "failed": "$(escape_json "$FAILED_DETAILS")",
+        "archive_dir": "$ARCHIVE_DIR",
+        "request_method": "$REQUEST_METHOD",
+        "timestamp": "$(date '+%Y-%m-%d %H:%M:%S')"
+    }
+}
+EOF
+
+# ===== SET EXIT CODE =====
+if [ "$SUCCESS" = "true" ]; then
+    exit 0
+else
+    exit 1
+fi
