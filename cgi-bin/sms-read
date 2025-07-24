@@ -1,0 +1,240 @@
+#!/bin/sh
+echo "Content-Type: application/json; charset=utf-8"
+echo ""
+
+# === CẤU HÌNH ===
+READ_STATUS_FILE="/tmp/sms_read_status"
+SENT_TIME_LOG="/tmp/sms_sent_times"
+mkdir -p /root/sms-archive
+ARCHIVE_DIR="/root/sms-archive"
+
+# ✅ BASE TIMESTAMP + SEQUENCE COUNTER
+BASE_TIME=$(date "+%Y-%m-%dT%H:%M:%S")
+SEQUENCE_COUNTER=0
+
+# Function tạo timestamp tuần tự
+get_next_timestamp() {
+    SEQUENCE_COUNTER=$((SEQUENCE_COUNTER + 1))
+    # Thêm milliseconds để đảm bảo unique và tăng dần
+    echo "${BASE_TIME}.$(printf "%03d" $SEQUENCE_COUNTER)+07:00"
+}
+
+# === TÌM MODEM ===
+MODEM_ID=""
+for i in $(seq 0 9); do
+    if mmcli -m "$i" >/dev/null 2>&1; then
+        MODEM_ID="$i"
+        break
+    fi
+done
+
+if [ -z "$MODEM_ID" ]; then
+    echo '{ "error": "Không tìm thấy modem nào hoạt động.", "messages": [] }'
+    exit 1
+fi
+
+# === TẠO FILE READ STATUS NẾU CHƯA CÓ ===
+[ ! -f "$READ_STATUS_FILE" ] && echo "{}" > "$READ_STATUS_FILE"
+
+# === CÁC HÀM HỖ TRỢ (giữ nguyên như cũ) ===
+is_message_read() {
+    local msg_id="$1"
+    if [ -f "$READ_STATUS_FILE" ]; then
+        grep -q "\"$msg_id\"[[:space:]]*:[[:space:]]*true" "$READ_STATUS_FILE"
+        return $?
+    fi
+    return 1
+}
+
+get_sent_timestamp() {
+    local sms_id="$1"
+    if [ -f "$SENT_TIME_LOG" ]; then
+        grep "^$sms_id:" "$SENT_TIME_LOG" | tail -1 | cut -d':' -f2-
+    fi
+}
+
+get_real_timestamp() {
+    local sms_id="$1"
+    local info="$2"
+    local pdu_type=$(echo "$info" | grep -m 1 "pdu type:" | sed 's/.*pdu type:[[:space:]]*//')
+    
+    if [ "$pdu_type" = "submit" ]; then
+        local logged_time=$(get_sent_timestamp "$sms_id")
+        if [ -n "$logged_time" ]; then
+            echo "$logged_time"
+            return 0
+        fi
+        echo "$(date "+%Y-%m-%dT%H:%M:%S+07:00")"
+        return 0
+    fi
+    
+    local timestamp=""
+    local at_response=$(timeout 5 mmcli -m "$MODEM_ID" --command="AT+CMGR=$sms_id" 2>/dev/null)
+    
+    if [ -n "$at_response" ]; then
+        local at_timestamp=$(echo "$at_response" | grep -oE '[0-9]{2}/[0-9]{2}/[0-9]{2},[0-9]{2}:[0-9]{2}:[0-9]{2}[+\-][0-9]{2}' | head -1)
+        
+        if [ -z "$at_timestamp" ]; then
+            at_timestamp=$(echo "$at_response" | grep -oE '[0-9]{2}/[0-9]{2}/[0-9]{2},[0-9]{2}:[0-9]{2}:[0-9]{2}' | head -1)
+        fi
+        
+        if [ -n "$at_timestamp" ]; then
+            local date_part=$(echo "$at_timestamp" | cut -d',' -f1)
+            local time_part=$(echo "$at_timestamp" | cut -d',' -f2)
+            
+            local day=$(echo "$date_part" | cut -d'/' -f1)
+            local month=$(echo "$date_part" | cut -d'/' -f2)
+            local year=$(echo "$date_part" | cut -d'/' -f3)
+            
+            local time_clean=$(echo "$time_part" | cut -d'+' -f1 | cut -d'-' -f1)
+            
+            if [ ${#year} -eq 2 ]; then
+                if [ "$year" -le 30 ]; then
+                    year="20$year"
+                else
+                    year="19$year"
+                fi
+            fi
+            
+            local timezone="+07:00"
+            
+            if [ ${#year} -eq 4 ] && [ ${#month} -eq 2 ] && [ ${#day} -eq 2 ] && [ ${#time_clean} -eq 8 ]; then
+                timestamp="${year}-${month}-${day}T${time_clean}${timezone}"
+                echo "$timestamp"
+                return 0
+            fi
+        fi
+    fi
+    
+    timestamp=$(echo "$info" | grep -m 1 "timestamp:" | sed 's/.*timestamp:[[:space:]]*//')
+    
+    if [ -n "$timestamp" ]; then
+        if echo "$timestamp" | grep -qE '\+[0-9]{2}$'; then
+            timestamp=$(echo "$timestamp" | sed 's/+\([0-9][0-9]\)$/+\1:00/')
+        elif echo "$timestamp" | grep -qE '\-[0-9]{2}$'; then
+            timestamp=$(echo "$timestamp" | sed 's/-\([0-9][0-9]\)$/-\1:00/')
+        fi
+        
+        if echo "$timestamp" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[+\-][0-9]{2}:[0-9]{2}'; then
+            echo "$timestamp"
+            return 0
+        fi
+    fi
+    
+    echo "$(date "+%Y-%m-%dT%H:%M:%S+07:00")"
+}
+
+# === BẮ‌T ĐẦU TRẢ JSON ===
+echo -n '{ "messages": ['
+
+FIRST=1
+
+# === 1. ĐỌC TẤT CẢ TIN NHẮN TỪ ARCHIVE TRƯỚC ===
+for file in $(ls -1r "$ARCHIVE_DIR"/*.json 2>/dev/null); do
+    [ -f "$file" ] || continue
+    [ "$FIRST" -eq 0 ] && echo ","
+    
+    json_content=$(cat "$file")
+    unified_timestamp=$(get_next_timestamp)
+    echo "$json_content" | sed "s/\"date\":\"[^\"]*\"/\"date\":\"$unified_timestamp\"/" | tr -d '\n'
+    
+    FIRST=0
+done
+
+
+# === 2. ĐỌC TIN NHẮN MỚI TỪ SIM ===
+CURRENT_STORAGE=$(mmcli -m "$MODEM_ID" --command="AT+CPMS?" | grep -o '"[A-Z]*"' | head -n1 | tr '[:upper:]' '[:lower:]' | tr -d '"')
+SMS_IDS=$(mmcli -m "$MODEM_ID" --messaging-list-sms 2>/dev/null | grep -E "(received|sent)" | awk -F '/' '{print $NF}')
+
+for ID in $SMS_IDS; do
+    # Kiểm tra xem tin nhắn đã được lưu chưa
+    ARCHIVE_PATH="$ARCHIVE_DIR/${ID}.json"
+    if [ -f "$ARCHIVE_PATH" ]; then
+        continue  # Bỏ qua tin nhắn đã được lưu
+    fi
+    
+    INFO=$(mmcli -s "$ID" 2>/dev/null)
+    [ -z "$INFO" ] && continue
+
+    TEXT=$(echo "$INFO" | awk '
+        /text:/ {
+            found=1;
+            sub(/.*text:[[:space:]]*/, "");
+            if ($0 != "") result=$0;
+            next
+        }
+        found && /Properties/ { found=0 }
+        found && !/^[[:space:]]*-+[[:space:]]*$/ {
+            gsub(/^[[:space:]]*\|[[:space:]]*/, "");
+            if ($0 != "" && $0 !~ /^[[:space:]]*$/) {
+                if (result != "") result=result " " $0;
+                else result=$0;
+            }
+        }
+        END {
+            gsub(/[[:space:]]+/, " ", result);
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", result);
+            gsub(/\\/, "\\\\", result);
+            gsub(/"/, "\\\"", result);
+            print result
+        }')
+
+    [ -z "$TEXT" ] && continue
+
+    NUMBER=$(echo "$INFO" | grep -m 1 "number:" | sed 's/.*number:[[:space:]]*//')
+    TYPE=$(echo "$INFO" | grep -m 1 "pdu type:" | sed 's/.*pdu type:[[:space:]]*//')
+    STATE=$(echo "$INFO" | grep -m 1 "state:" | sed 's/.*state:[[:space:]]*//')
+    STORAGE=$(echo "$INFO" | grep -m 1 "storage:" | sed 's/.*storage:[[:space:]]*//')
+    DATE=$(get_real_timestamp "$ID" "$INFO")
+    [ -z "$STORAGE" ] && STORAGE="$CURRENT_STORAGE"
+
+    if is_message_read "$ID"; then
+        READ_STATUS=1
+    else
+        [ "$TYPE" = "submit" ] && READ_STATUS=1 || READ_STATUS=0
+    fi
+
+    # Escape JSON
+    esc() { echo "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+    NUMBER_ESC=$(esc "$NUMBER")
+    TEXT_ESC=$(esc "$TEXT")
+    TYPE_ESC=$(esc "$TYPE")
+    STATE_ESC=$(esc "$STATE")
+    STORAGE_ESC=$(esc "$STORAGE")
+
+    # Lưu vào file archive
+    cat <<EOF > "$ARCHIVE_PATH"
+{
+  "id": $ID,
+  "number": "$NUMBER_ESC",
+  "text": "$TEXT_ESC",
+  "date": "$DATE",
+  "type": "$TYPE_ESC",
+  "state": "$STATE_ESC",
+  "storage": "router",
+  "read_status": $READ_STATUS
+}
+EOF
+
+    # Kiểm tra xem file đã được lưu thành công chưa
+    if [ -s "$ARCHIVE_PATH" ]; then
+        # Xóa tin nhắn khỏi SIM
+        mmcli -m "$MODEM_ID" --messaging-delete-sms="$ID" >/dev/null 2>&1
+        
+        # Thêm vào response JSON
+        [ "$FIRST" -eq 0 ] && echo ","
+        echo -n "{
+            \"id\": $ID,
+            \"number\": \"$NUMBER_ESC\",
+            \"text\": \"$TEXT_ESC\",
+            \"date\": \"$DATE\",
+            \"type\": \"$TYPE_ESC\",
+            \"state\": \"$STATE_ESC\",
+            \"storage\": \"$STORAGE_ESC\",
+            \"read_status\": $READ_STATUS
+        }" | tr -d '\n'
+        FIRST=0
+    fi
+done
+
+echo " ] }"
